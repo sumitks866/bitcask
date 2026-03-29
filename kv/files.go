@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+type DataFile struct {
+	ID     int64
+	Path   string
+	File   *os.File
+	offset int64
+}
+
 func (df *DataFile) Append(data []byte, shouldSync bool) error {
 	_, err := df.File.Write(data)
 	if err != nil {

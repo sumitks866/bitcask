@@ -5,16 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
+	"sync"
 	"time"
 )
-
-type DataFile struct {
-	ID     int64
-	Path   string
-	File   *os.File
-	offset int64
-}
 
 type KVStore struct {
 	maxFileSize int64
@@ -22,6 +15,7 @@ type KVStore struct {
 	activeFile  *DataFile
 	syncOnPut   bool // TODO: sync options configuration
 	keyDir      *KeyDir
+	lock        sync.RWMutex
 }
 
 func NewKVStore() *KVStore {
@@ -57,25 +51,25 @@ func NewKVStore() *KVStore {
 }
 
 func (kv *KVStore) Put(key []byte, value []byte) error {
+	kv.lock.Lock()
+	defer kv.lock.Unlock()
+
 	entry := &Entry{
 		Key:       key,
 		Value:     value,
 		Timestamp: time.Now().Unix(),
 	}
 
-	// Capture offset before writing
 	entryOffset := kv.activeFile.offset
-	err := kv.storeEntry(entry)
+	entrySize, err := kv.storeEntry(entry)
 	if err != nil {
-		log.Printf("ERROR: KVStore.Put key=%q err=%v", string(key), err)
 		return err
 	}
 
-	entrySize := int32(headerSize + len(key) + len(value))
 	kv.keyDir.Put(string(key), &IndexItem{
 		FileId:    kv.activeFile.ID,
 		Offset:    entryOffset,
-		Size:      entrySize,
+		Size:      int32(entrySize),
 		Timestamp: entry.Timestamp,
 	})
 
@@ -84,11 +78,14 @@ func (kv *KVStore) Put(key []byte, value []byte) error {
 }
 
 func (kv *KVStore) Get(key []byte) ([]byte, error) {
+	kv.lock.RLock()
+	defer kv.lock.RUnlock()
+
 	item, ok := kv.keyDir.Get(string(key))
 	if !ok {
 		return nil, fmt.Errorf("Key not found")
 	}
-
+	// TODO: under high concurrent load, many file may stay open simultaneouly. Implement pooling or LRU cache for file handles
 	file, err := openDataFile(item.FileId)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open data file ID %d: %w", item.FileId, err)
@@ -103,23 +100,58 @@ func (kv *KVStore) Get(key []byte) ([]byte, error) {
 	return entry.Value, nil
 }
 
+func (kv *KVStore) Delete(key []byte) error {
+	return kv.Put(key, Tombstone)
+}
+
 // stores entry in active file and updates in-memory index
-func (kv *KVStore) storeEntry(entry *Entry) error {
+func (kv *KVStore) storeEntry(entry *Entry) (int, error) {
 	log.Printf("INFO: KVStore.storeEntry key=%q", string(entry.Key))
 
 	encodedEntry, err := EncodeEntry(entry)
 	if err != nil {
-		return fmt.Errorf("Failed to encode entry: %w", err)
+		return 0, fmt.Errorf("Failed to encode entry: %w", err)
 	}
 
 	// TODO: handle rotation if current file exceeds max size
+	if kv.activeFile.offset+int64(len(encodedEntry)) > kv.maxFileSize {
+		log.Printf("INFO: Active file ID %d exceeded max size. Rotating file.", kv.activeFile.ID)
+		err := kv.rotateActiveFile()
+		if err != nil {
+			return 0, fmt.Errorf("Failed to rotate active file: %w", err)
+		}
+		log.Printf("INFO: Rotation complete. New active file ID %d", kv.activeFile.ID)
+	}
 
 	err = kv.activeFile.Append(encodedEntry, kv.syncOnPut)
 	if err != nil {
-		return fmt.Errorf("Failed to append entry: %w", err)
+		return 0, fmt.Errorf("Failed to append entry: %w", err)
 	}
 
 	kv.maxFileID = kv.activeFile.ID
+	return len(encodedEntry), nil
+}
+
+func (kv *KVStore) rotateActiveFile() error {
+	// close current active file
+	err := kv.activeFile.File.Close()
+	if err != nil {
+		return fmt.Errorf("Failed to close active file ID %d: %w", kv.activeFile.ID, err)
+	}
+
+	// derive new file id from kv.maxFileID to ensure monotonic progression
+	newFileId := kv.maxFileID + 1
+	// fallback: if maxFileID wasn't up-to-date, ensure it's greater than activeFile.ID
+	if newFileId <= kv.activeFile.ID {
+		newFileId = kv.activeFile.ID + 1
+	}
+	newActiveFile, err := createNewDataFile(newFileId)
+	if err != nil {
+		return fmt.Errorf("Failed to create new data file ID %d: %w", newFileId, err)
+	}
+	kv.activeFile = newActiveFile
+	kv.maxFileID = newFileId
+	log.Printf("INFO: New active file created with ID %d", newFileId)
 	return nil
 }
 
@@ -138,6 +170,7 @@ func (kv *KVStore) loadIndex() error {
 
 		offset := int64(0)
 		for {
+			// TODO: optimize by implementing hint files to avoid scanning entire file on startup
 			entry, bytesRead, err := ReadEntry(file.File, offset)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
@@ -161,7 +194,7 @@ func (kv *KVStore) loadIndex() error {
 			offset += int64(bytesRead)
 		}
 
-		defer file.File.Close()
+		file.File.Close()
 	}
 
 	return nil

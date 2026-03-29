@@ -51,8 +51,7 @@ func ReadEntry(file *os.File, offset int64) (*Entry, int32, error) {
 		return nil, 0, fmt.Errorf("Incomplete entry header")
 	}
 
-	// parse header
-	crc := int32(binary.LittleEndian.Uint32(header[0:4]))
+	crc := uint32(binary.LittleEndian.Uint32(header[0:4]))
 	timestamp := int64(binary.LittleEndian.Uint64(header[4:12]))
 	keySize := int32(binary.LittleEndian.Uint32(header[12:16]))
 	valueSize := int32(binary.LittleEndian.Uint32(header[16:20]))
@@ -73,8 +72,8 @@ func ReadEntry(file *os.File, offset int64) (*Entry, int32, error) {
 	copy(checkBuf[16:], data)                       // key + value
 
 	calculatedCrc := crc32.ChecksumIEEE(checkBuf)
-	if int32(calculatedCrc) != crc {
-		return nil, 0, fmt.Errorf("CRC mismatch: expected %d, got %d", crc, int32(calculatedCrc))
+	if calculatedCrc != crc {
+		return nil, 0, fmt.Errorf("CRC mismatch: expected %d, got %d", crc, calculatedCrc)
 	}
 
 	entry := &Entry{
