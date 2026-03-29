@@ -37,7 +37,7 @@ func NewKVStore() *KVStore {
 
 	kv := &KVStore{
 		activeFile:  activeFile,
-		maxFileSize: 1024 * 1024, // 1MB
+		maxFileSize: 1024 * 1024, // 1MB for testing, can be configured as needed
 		maxFileID:   maxFileID,
 		keyDir:      keyDir,
 	}
@@ -60,20 +60,24 @@ func (kv *KVStore) Put(key []byte, value []byte) error {
 		Timestamp: time.Now().Unix(),
 	}
 
-	entryOffset := kv.activeFile.offset
-	entrySize, err := kv.storeEntry(entry)
+	fileId, entryOffset, entrySize, err := kv.storeEntry(entry)
 	if err != nil {
 		return err
 	}
 
+	if len(value) == 0 {
+		kv.keyDir.Delete(string(key))
+		return nil
+	}
+
 	kv.keyDir.Put(string(key), &IndexItem{
-		FileId:    kv.activeFile.ID,
+		FileId:    fileId,
 		Offset:    entryOffset,
 		Size:      int32(entrySize),
 		Timestamp: entry.Timestamp,
 	})
 
-	log.Printf("INFO: KVStore.Put key=%q file offset after write: %d", string(key), kv.activeFile.offset)
+	// log.Printf("INFO: KVStore.Put key=%q file offset after write: %d", string(key), kv.activeFile.offset)
 	return nil
 }
 
@@ -104,32 +108,35 @@ func (kv *KVStore) Delete(key []byte) error {
 	return kv.Put(key, Tombstone)
 }
 
-// stores entry in active file and updates in-memory index
-func (kv *KVStore) storeEntry(entry *Entry) (int, error) {
-	log.Printf("INFO: KVStore.storeEntry key=%q", string(entry.Key))
+// stores entry in active file and returns file id, offset and size
+func (kv *KVStore) storeEntry(entry *Entry) (int64, int64, int, error) {
 
 	encodedEntry, err := EncodeEntry(entry)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to encode entry: %w", err)
+		return 0, 0, 0, fmt.Errorf("Failed to encode entry: %w", err)
 	}
 
-	// TODO: handle rotation if current file exceeds max size
 	if kv.activeFile.offset+int64(len(encodedEntry)) > kv.maxFileSize {
 		log.Printf("INFO: Active file ID %d exceeded max size. Rotating file.", kv.activeFile.ID)
 		err := kv.rotateActiveFile()
 		if err != nil {
-			return 0, fmt.Errorf("Failed to rotate active file: %w", err)
+			return 0, 0, 0, fmt.Errorf("Failed to rotate active file: %w", err)
 		}
 		log.Printf("INFO: Rotation complete. New active file ID %d", kv.activeFile.ID)
 	}
 
+	// capture start offset before append
+	startOffset := kv.activeFile.offset
+
 	err = kv.activeFile.Append(encodedEntry, kv.syncOnPut)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to append entry: %w", err)
+		return 0, 0, 0, fmt.Errorf("Failed to append entry: %w", err)
 	}
 
+	// ensure maxFileID reflects the active file
 	kv.maxFileID = kv.activeFile.ID
-	return len(encodedEntry), nil
+
+	return kv.activeFile.ID, startOffset, len(encodedEntry), nil
 }
 
 func (kv *KVStore) rotateActiveFile() error {
@@ -151,7 +158,6 @@ func (kv *KVStore) rotateActiveFile() error {
 	}
 	kv.activeFile = newActiveFile
 	kv.maxFileID = newFileId
-	log.Printf("INFO: New active file created with ID %d", newFileId)
 	return nil
 }
 
