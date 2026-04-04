@@ -11,14 +11,17 @@ import (
 
 type KVStore struct {
 	maxFileSize int64
-	maxFileID   int64
+	maxFileID   int64 // TODO: should we have lock on this?
 	activeFile  *DataFile
 	syncOnPut   bool // TODO: sync options configuration
 	keyDir      *KeyDir
 	lock        sync.RWMutex
+
+	compactionInterval time.Duration
+	compactionStop     chan struct{} // closed to signal worker to stop
 }
 
-func NewKVStore() *KVStore {
+func NewKVStore(cfg *KVStoreConfig) *KVStore {
 	log.Printf("INFO: Initializing KVStore")
 
 	activeFile, err := getActiveFile()
@@ -34,12 +37,17 @@ func NewKVStore() *KVStore {
 	}
 
 	keyDir := NewKeyDir()
+	cfg.applyDefaults()
 
 	kv := &KVStore{
-		activeFile:  activeFile,
-		maxFileSize: 1024 * 1024, // 1MB for testing, can be configured as needed
-		maxFileID:   maxFileID,
-		keyDir:      keyDir,
+		maxFileSize:        *cfg.MaxFileSize,
+		syncOnPut:          *cfg.SyncOnPut,
+		compactionInterval: *cfg.CompactionInterval,
+
+		activeFile:     activeFile,
+		maxFileID:      maxFileID,
+		keyDir:         keyDir,
+		compactionStop: make(chan struct{}),
 	}
 
 	err = kv.loadIndex()
@@ -47,7 +55,36 @@ func NewKVStore() *KVStore {
 		log.Panicf("FATAL: Failed to load index: %v", err)
 	}
 
+	go kv.compactionWorker()
+
 	return kv
+}
+
+// compactionWorker runs Compact() on a fixed interval until Close() is called.
+func (kv *KVStore) compactionWorker() {
+	ticker := time.NewTicker(kv.compactionInterval)
+	defer ticker.Stop()
+	log.Printf("INFO: Compaction worker started (interval: %s)", kv.compactionInterval)
+	for {
+		select {
+		case <-ticker.C:
+			log.Printf("INFO: Compaction worker triggering compact")
+			if err := kv.Compact(); err != nil {
+				log.Printf("ERROR: Compaction failed: %v", err)
+			}
+		case <-kv.compactionStop:
+			log.Printf("INFO: Compaction worker stopped")
+			return
+		}
+	}
+}
+
+// Close stops the compaction worker. Call this when shutting down.
+func (kv *KVStore) Close() {
+	close(kv.compactionStop)
+	if err := kv.activeFile.File.Close(); err != nil {
+		log.Printf("ERROR: Failed to close active file: %v", err)
+	}
 }
 
 func (kv *KVStore) Put(key []byte, value []byte) error {
@@ -96,7 +133,7 @@ func (kv *KVStore) Get(key []byte) ([]byte, error) {
 	}
 	defer file.File.Close()
 
-	entry, _, err := ReadEntry(file.File, item.Offset)
+	entry, _, _, err := ReadEntry(file.File, item.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to read entry from file ID %d at offset %d: %w", item.FileId, item.Offset, err)
 	}
@@ -177,7 +214,7 @@ func (kv *KVStore) loadIndex() error {
 		offset := int64(0)
 		for {
 			// TODO: optimize by implementing hint files to avoid scanning entire file on startup
-			entry, bytesRead, err := ReadEntry(file.File, offset)
+			entry, _, bytesRead, err := ReadEntry(file.File, offset)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break

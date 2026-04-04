@@ -16,7 +16,7 @@ type db struct {
 
 func NewDB() DB {
 	return &db{
-		store: kv.NewKVStore(),
+		store: kv.NewKVStore(nil),
 	}
 }
 

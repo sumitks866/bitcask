@@ -39,16 +39,29 @@ func EncodeEntry(entry *Entry) ([]byte, error) {
 	return buf, nil
 }
 
+func ReadEntryBytes(file *os.File, offset int64, entrySize int32) ([]byte, error) {
+	data := make([]byte, entrySize)
+	n, err := file.ReadAt(data, offset)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading entry data: %w", err)
+	}
+	if int32(n) < entrySize {
+		return nil, fmt.Errorf("Incomplete entry data")
+	}
+
+	return data, nil
+}
+
 // Returns the entry, total bytes read (header + key + value), and error if any
-func ReadEntry(file *os.File, offset int64) (*Entry, int32, error) {
+func ReadEntry(file *os.File, offset int64) (entry *Entry, entryBytes []byte, entrySize int32, err error) {
 	// read header first (20 bytes)
 	header := make([]byte, headerSize)
 	n, err := file.ReadAt(header, offset)
 	if err != nil {
-		return nil, 0, fmt.Errorf("Error reading entry header: %w", err)
+		return nil, nil, 0, fmt.Errorf("Error reading entry header: %w", err)
 	}
 	if n < headerSize {
-		return nil, 0, fmt.Errorf("Incomplete entry header")
+		return nil, nil, 0, fmt.Errorf("Incomplete entry header")
 	}
 
 	crc := uint32(binary.LittleEndian.Uint32(header[0:4]))
@@ -56,16 +69,18 @@ func ReadEntry(file *os.File, offset int64) (*Entry, int32, error) {
 	keySize := int32(binary.LittleEndian.Uint32(header[12:16]))
 	valueSize := int32(binary.LittleEndian.Uint32(header[16:20]))
 
+	// TODO: we can prevent another syscall by getting file size as it is already stored in the index
 	dataSize := keySize + valueSize
 	data := make([]byte, dataSize)
 	n, err = file.ReadAt(data, offset+headerSize)
 	if err != nil {
-		return nil, 0, fmt.Errorf("Error reading entry data: %w", err)
+		return nil, nil, 0, fmt.Errorf("Error reading entry data: %w", err)
 	}
 	if int32(n) < dataSize {
-		return nil, 0, fmt.Errorf("Incomplete entry data")
+		return nil, nil, 0, fmt.Errorf("Incomplete entry data")
 	}
 
+	// TODO: eliminate checkbuf allocation
 	// verify CRC
 	checkBuf := make([]byte, headerSize+dataSize-4) // exclude CRC field
 	copy(checkBuf[0:16], header[4:20])              // copy header (timestamp + keysize + valuesize)
@@ -73,14 +88,16 @@ func ReadEntry(file *os.File, offset int64) (*Entry, int32, error) {
 
 	calculatedCrc := crc32.ChecksumIEEE(checkBuf)
 	if calculatedCrc != crc {
-		return nil, 0, fmt.Errorf("CRC mismatch: expected %d, got %d", crc, calculatedCrc)
+		return nil, nil, 0, fmt.Errorf("CRC mismatch: expected %d, got %d", crc, calculatedCrc)
 	}
 
-	entry := &Entry{
+	entry = &Entry{
 		Key:       data[0:keySize],
 		Value:     data[keySize:],
 		Timestamp: timestamp,
 	}
 
-	return entry, headerSize + dataSize, nil
+	entryBytes = append(header, data...)
+
+	return entry, entryBytes, headerSize + dataSize, nil
 }

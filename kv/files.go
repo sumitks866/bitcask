@@ -131,6 +131,13 @@ func getSortedDataFileIds() ([]int64, error) {
 	return fileIds, nil
 }
 
+func deleteDataFile(id int64) error {
+	fileName := fmt.Sprintf("%d%s", id, fileExt)
+	filePath := filepath.Join(dataDir, fileName)
+
+	return os.Remove(filePath)
+}
+
 // isValidDataFileName checks if the given file name matches the expected data file pattern and extracts the file ID
 func isValidDataFileName(name string) (int64, bool) {
 	if !strings.HasSuffix(name, fileExt) {
@@ -144,4 +151,11 @@ func isValidDataFileName(name string) (int64, bool) {
 	}
 
 	return int64(id), true
+}
+
+func createNewHintFile(id int64) (*os.File, error) {
+	fileName := fmt.Sprintf("%d%s", id, hintFileExt)
+	filePath := filepath.Join(dataDir, fileName)
+
+	return os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, filePerm)
 }
