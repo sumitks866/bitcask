@@ -3,12 +3,17 @@ package kv
 import "time"
 
 type KVStoreConfig struct {
+	DataDir            *string
 	MaxFileSize        *int64
 	SyncOnPut          *bool
 	CompactionInterval *time.Duration
 }
 
 func (cfg *KVStoreConfig) applyDefaults() {
+	if cfg.DataDir == nil {
+		d := defaultDataDir
+		cfg.DataDir = &d
+	}
 	if cfg.MaxFileSize == nil {
 		defaultSize := int64(1024 * 512) // 512 KB
 		cfg.MaxFileSize = &defaultSize

@@ -31,7 +31,7 @@ func (df *DataFile) Append(data []byte, shouldSync bool) error {
 }
 
 // getActiveFile returns the current active data file, creating a new one if necessary
-func getActiveFile() (*DataFile, error) {
+func getActiveFile(dataDir string) (*DataFile, error) {
 	_, err := os.ReadDir(dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -39,24 +39,24 @@ func getActiveFile() (*DataFile, error) {
 			if err != nil {
 				return nil, fmt.Errorf("Failed to create data directory: %w", err)
 			}
-			return createNewDataFile(1)
+			return createNewDataFile(dataDir, 1)
 		}
 		return nil, fmt.Errorf("Failed to read data directory: %w", err)
 	}
 
-	maxFileId, err := getMaxFileID()
+	maxFileId, err := getMaxFileID(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to get max file ID: %w", err)
 	}
 	// if no files exist, create a new one with ID 1
 	if maxFileId == 0 {
-		return createNewDataFile(1)
+		return createNewDataFile(dataDir, 1)
 	}
 
-	return openDataFile(int64(maxFileId))
+	return openDataFile(dataDir, int64(maxFileId))
 }
 
-func createNewDataFile(id int64) (*DataFile, error) {
+func createNewDataFile(dataDir string, id int64) (*DataFile, error) {
 	fileName := fmt.Sprintf("%d%s", id, fileExt)
 	filePath := filepath.Join(dataDir, fileName)
 
@@ -68,7 +68,7 @@ func createNewDataFile(id int64) (*DataFile, error) {
 	return &DataFile{ID: id, Path: filePath, File: file, offset: 0}, nil
 }
 
-func openDataFile(id int64) (*DataFile, error) {
+func openDataFile(dataDir string, id int64) (*DataFile, error) {
 	fileName := fmt.Sprintf("%d%s", id, fileExt)
 	filePath := filepath.Join(dataDir, fileName)
 
@@ -91,8 +91,8 @@ func openDataFile(id int64) (*DataFile, error) {
 	}, nil
 }
 
-func getMaxFileID() (int64, error) {
-	fileIds, err := getSortedDataFileIds()
+func getMaxFileID(dataDir string) (int64, error) {
+	fileIds, err := getSortedDataFileIds(dataDir)
 	if err != nil {
 		return 0, err
 	}
@@ -105,7 +105,7 @@ func getMaxFileID() (int64, error) {
 	return maxFileId, nil
 }
 
-func getSortedDataFileIds() ([]int64, error) {
+func getSortedDataFileIds(dataDir string) ([]int64, error) {
 	files, err := os.ReadDir(dataDir)
 	if err != nil {
 		return nil, err
@@ -131,7 +131,7 @@ func getSortedDataFileIds() ([]int64, error) {
 	return fileIds, nil
 }
 
-func deleteDataFile(id int64) error {
+func deleteDataFile(dataDir string, id int64) error {
 	fileName := fmt.Sprintf("%d%s", id, fileExt)
 	filePath := filepath.Join(dataDir, fileName)
 
@@ -153,9 +153,16 @@ func isValidDataFileName(name string) (int64, bool) {
 	return int64(id), true
 }
 
-func createNewHintFile(id int64) (*os.File, error) {
+func createNewHintFile(dataDir string, id int64) (*os.File, error) {
 	fileName := fmt.Sprintf("%d%s", id, hintFileExt)
 	filePath := filepath.Join(dataDir, fileName)
 
 	return os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, filePerm)
+}
+
+func openHintFile(dataDir string, id int64) (*os.File, error) {
+	fileName := fmt.Sprintf("%d%s", id, hintFileExt)
+	filePath := filepath.Join(dataDir, fileName)
+
+	return os.Open(filePath)
 }

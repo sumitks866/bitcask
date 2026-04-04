@@ -28,11 +28,14 @@ func newTestKV(t testing.TB, maxFileSize int64) (*KVStore, func()) {
 		t.Fatalf("chdir into tmpDir: %v", err)
 	}
 
-	kv := NewKVStore(&KVStoreConfig{
+	kv, err := NewKVStore(&KVStoreConfig{
 		MaxFileSize:        ptr(maxFileSize),
 		SyncOnPut:          ptr(false),
 		CompactionInterval: ptr(24 * time.Hour),
 	})
+	if err != nil {
+		t.Fatalf("NewKVStore: %v", err)
+	}
 
 	return kv, func() {
 		kv.Close()
@@ -80,7 +83,7 @@ func mustNotExist(t testing.TB, kv *KVStore, key string) {
 // dataFileCount returns the number of .data files currently on disk.
 func dataFileCount(t testing.TB) int {
 	t.Helper()
-	ids, err := getSortedDataFileIds()
+	ids, err := getSortedDataFileIds(defaultDataDir)
 	if err != nil {
 		t.Fatalf("getSortedDataFileIds: %v", err)
 	}
@@ -332,11 +335,14 @@ func BenchmarkCompact(b *testing.B) {
 		orig, _ := os.Getwd()
 		_ = os.Chdir(tmpDir)
 
-		kv := NewKVStore(&KVStoreConfig{
+		kv, err := NewKVStore(&KVStoreConfig{
 			MaxFileSize:        ptr(int64(maxFileSize)),
 			SyncOnPut:          ptr(false),
 			CompactionInterval: ptr(24 * time.Hour),
 		})
+		if err != nil {
+			b.Fatalf("NewKVStore: %v", err)
+		}
 
 		value := make([]byte, 50)
 		for round := 0; round <= overwrites; round++ {
@@ -381,12 +387,14 @@ func BenchmarkCompact_LargeDataset(b *testing.B) {
 		orig, _ := os.Getwd()
 		_ = os.Chdir(tmpDir)
 
-		kv := NewKVStore(&KVStoreConfig{
+		kv, err := NewKVStore(&KVStoreConfig{
 			MaxFileSize:        ptr(int64(maxFileSize)),
 			SyncOnPut:          ptr(false),
 			CompactionInterval: ptr(24 * time.Hour),
 		})
-
+		if err != nil {
+			b.Fatalf("NewKVStore: %v", err)
+		}
 		value := make([]byte, 50)
 		for round := 0; round <= overwrites; round++ {
 			for j := 0; j < numKeys; j++ {

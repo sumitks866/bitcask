@@ -10,54 +10,59 @@ import (
 )
 
 type KVStore struct {
+	dataDir     string
 	maxFileSize int64
-	maxFileID   int64 // TODO: should we have lock on this?
+	maxFileID   int64
 	activeFile  *DataFile
-	syncOnPut   bool // TODO: sync options configuration
+	syncOnPut   bool
 	keyDir      *KeyDir
 	lock        sync.RWMutex
+
+	fileCache map[int64]*DataFile // cached read-only file handles
 
 	compactionInterval time.Duration
 	compactionStop     chan struct{} // closed to signal worker to stop
 }
 
-func NewKVStore(cfg *KVStoreConfig) *KVStore {
-	log.Printf("INFO: Initializing KVStore")
-
-	activeFile, err := getActiveFile()
-	if err != nil {
-		log.Panicf("FATAL: Failed to initialize KVStore: %v", err)
+func NewKVStore(cfg *KVStoreConfig) (*KVStore, error) {
+	if cfg == nil {
+		cfg = &KVStoreConfig{}
 	}
-	log.Printf("INFO: KVStore initialized with active file ID %d", activeFile.ID)
-	log.Printf("INFO: active file offset: %d", activeFile.offset)
-
-	maxFileID, err := getMaxFileID()
-	if err != nil {
-		panic(fmt.Sprintf("Failed to get max file ID: %v", err))
-	}
-
-	keyDir := NewKeyDir()
 	cfg.applyDefaults()
 
+	log.Printf("INFO: Initializing KVStore (dataDir=%s)", *cfg.DataDir)
+
+	activeFile, err := getActiveFile(*cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize active file: %w", err)
+	}
+	log.Printf("INFO: KVStore initialized with active file ID %d", activeFile.ID)
+
+	maxFileID, err := getMaxFileID(*cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get max file ID: %w", err)
+	}
+
 	kv := &KVStore{
+		dataDir:            *cfg.DataDir,
 		maxFileSize:        *cfg.MaxFileSize,
 		syncOnPut:          *cfg.SyncOnPut,
 		compactionInterval: *cfg.CompactionInterval,
 
 		activeFile:     activeFile,
 		maxFileID:      maxFileID,
-		keyDir:         keyDir,
+		keyDir:         NewKeyDir(),
+		fileCache:      make(map[int64]*DataFile),
 		compactionStop: make(chan struct{}),
 	}
 
-	err = kv.loadIndex()
-	if err != nil {
-		log.Panicf("FATAL: Failed to load index: %v", err)
+	if err := kv.loadIndex(); err != nil {
+		return nil, fmt.Errorf("failed to load index: %w", err)
 	}
 
 	go kv.compactionWorker()
 
-	return kv
+	return kv, nil
 }
 
 // compactionWorker runs Compact() on a fixed interval until Close() is called.
@@ -79,12 +84,20 @@ func (kv *KVStore) compactionWorker() {
 	}
 }
 
-// Close stops the compaction worker. Call this when shutting down.
+// Close stops the compaction worker and releases all resources.
 func (kv *KVStore) Close() {
 	close(kv.compactionStop)
+	kv.lock.Lock()
+	defer kv.lock.Unlock()
 	if err := kv.activeFile.File.Close(); err != nil {
 		log.Printf("ERROR: Failed to close active file: %v", err)
 	}
+	for id, f := range kv.fileCache {
+		if err := f.File.Close(); err != nil {
+			log.Printf("ERROR: Failed to close cached file %d: %v", id, err)
+		}
+	}
+	kv.fileCache = nil
 }
 
 func (kv *KVStore) Put(key []byte, value []byte) error {
@@ -124,14 +137,13 @@ func (kv *KVStore) Get(key []byte) ([]byte, error) {
 
 	item, ok := kv.keyDir.Get(string(key))
 	if !ok {
-		return nil, fmt.Errorf("Key not found")
+		return nil, ErrKeyNotFound
 	}
-	// TODO: under high concurrent load, many file may stay open simultaneouly. Implement pooling or LRU cache for file handles
-	file, err := openDataFile(item.FileId)
+
+	file, err := kv.getCachedFile(item.FileId)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open data file ID %d: %w", item.FileId, err)
 	}
-	defer file.File.Close()
 
 	entry, _, _, err := ReadEntry(file.File, item.Offset)
 	if err != nil {
@@ -139,6 +151,37 @@ func (kv *KVStore) Get(key []byte) ([]byte, error) {
 	}
 
 	return entry.Value, nil
+}
+
+// getCachedFile returns an open DataFile from the cache, opening it on first access.
+// Must be called while holding at least kv.lock.RLock().
+// Note: ReadAt is goroutine-safe, so concurrent readers sharing a cached handle is fine.
+func (kv *KVStore) getCachedFile(id int64) (*DataFile, error) {
+	if f, ok := kv.fileCache[id]; ok {
+		return f, nil
+	}
+
+	// Upgrade to write lock — we need to mutate the cache.
+	// We must re-check after acquiring the write lock because another goroutine
+	// may have populated the cache between our RUnlock and Lock.
+	kv.lock.RUnlock()
+	kv.lock.Lock()
+	defer func() {
+		// Downgrade back to read lock before returning to the RLock-holding caller.
+		kv.lock.Unlock()
+		kv.lock.RLock()
+	}()
+
+	if f, ok := kv.fileCache[id]; ok {
+		return f, nil
+	}
+
+	f, err := openDataFile(kv.dataDir, id)
+	if err != nil {
+		return nil, err
+	}
+	kv.fileCache[id] = f
+	return f, nil
 }
 
 func (kv *KVStore) Delete(key []byte) error {
@@ -189,7 +232,7 @@ func (kv *KVStore) rotateActiveFile() error {
 	if newFileId <= kv.activeFile.ID {
 		newFileId = kv.activeFile.ID + 1
 	}
-	newActiveFile, err := createNewDataFile(newFileId)
+	newActiveFile, err := createNewDataFile(kv.dataDir, newFileId)
 	if err != nil {
 		return fmt.Errorf("Failed to create new data file ID %d: %w", newFileId, err)
 	}
@@ -198,46 +241,85 @@ func (kv *KVStore) rotateActiveFile() error {
 	return nil
 }
 
-// builds in-memory index by scanning all data files on startup
+// loadIndex builds the in-memory keydir by scanning data files on startup.
+// For files that have a companion .hint file (produced by compaction), the hint
+// file is used instead — this skips reading values and is much faster.
 func (kv *KVStore) loadIndex() error {
-	fileIds, err := getSortedDataFileIds()
+	fileIds, err := getSortedDataFileIds(kv.dataDir)
 	if err != nil {
 		return fmt.Errorf("Failed to get data file IDs: %w", err)
 	}
 
 	for _, id := range fileIds {
-		file, err := openDataFile(id)
-		if err != nil {
-			return fmt.Errorf("Failed to open data file ID %d: %w", id, err)
+		if kv.loadIndexFromHint(id) {
+			continue
 		}
+		if err := kv.loadIndexFromDataFile(id); err != nil {
+			return err
+		}
+	}
 
-		offset := int64(0)
-		for {
-			// TODO: optimize by implementing hint files to avoid scanning entire file on startup
-			entry, _, bytesRead, err := ReadEntry(file.File, offset)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				log.Printf("ERROR: Failed to read entry from file ID %d at offset %d: %v", id, offset, err)
+	return nil
+}
+
+// loadIndexFromHint attempts to populate the keydir from a .hint file.
+// Returns true if the hint file was found and loaded successfully.
+func (kv *KVStore) loadIndexFromHint(fileId int64) bool {
+	items, err := readHintFile(kv.dataDir, fileId)
+	if err != nil {
+		// hint file doesn't exist or is unreadable — fall back to data file
+		return false
+	}
+
+	for _, h := range items {
+		key := string(h.Key)
+		entrySize := headerSize + h.KeySize + h.ValueSize
+
+		if h.ValueSize == 0 {
+			kv.keyDir.Delete(key)
+		} else {
+			kv.keyDir.Put(key, &IndexItem{
+				FileId:    fileId,
+				Offset:    h.Offset,
+				Size:      int32(entrySize),
+				Timestamp: h.Timestamp,
+			})
+		}
+	}
+	return true
+}
+
+// loadIndexFromDataFile scans every entry in a data file to populate the keydir.
+func (kv *KVStore) loadIndexFromDataFile(id int64) error {
+	file, err := openDataFile(kv.dataDir, id)
+	if err != nil {
+		return fmt.Errorf("Failed to open data file ID %d: %w", id, err)
+	}
+	defer file.File.Close()
+
+	offset := int64(0)
+	for {
+		entry, _, bytesRead, err := ReadEntry(file.File, offset)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-
-			if len(entry.Value) == 0 {
-				kv.keyDir.Delete(string(entry.Key))
-			} else {
-				kv.keyDir.Put(string(entry.Key), &IndexItem{
-					FileId:    id,
-					Offset:    offset,
-					Size:      int32(bytesRead),
-					Timestamp: entry.Timestamp,
-				})
-			}
-
-			offset += int64(bytesRead)
+			log.Printf("ERROR: Failed to read entry from file ID %d at offset %d: %v", id, offset, err)
+			break
 		}
 
-		file.File.Close()
+		if len(entry.Value) == 0 {
+			kv.keyDir.Delete(string(entry.Key))
+		} else {
+			kv.keyDir.Put(string(entry.Key), &IndexItem{
+				FileId:    id,
+				Offset:    offset,
+				Size:      int32(bytesRead),
+				Timestamp: entry.Timestamp,
+			})
+		}
+
+		offset += int64(bytesRead)
 	}
 
 	return nil

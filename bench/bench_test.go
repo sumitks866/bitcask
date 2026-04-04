@@ -22,7 +22,10 @@ func setupDB(b *testing.B) (bitcask.DB, func()) {
 	if err := os.Chdir("testdata"); err != nil {
 		b.Fatalf("failed to chdir: %v", err)
 	}
-	db := bitcask.NewDB()
+	db, err := bitcask.NewDB()
+	if err != nil {
+		b.Fatalf("NewDB: %v", err)
+	}
 	cleanup := func() {
 		// go back up and remove leftover data files
 		_ = os.Chdir("..")

@@ -8,16 +8,19 @@ type DB interface {
 	Put(key []byte, value []byte) error
 	Get(key []byte) ([]byte, error)
 	Delete(key []byte) error
+	Close()
 }
 
 type db struct {
 	store *kv.KVStore
 }
 
-func NewDB() DB {
-	return &db{
-		store: kv.NewKVStore(nil),
+func NewDB() (DB, error) {
+	store, err := kv.NewKVStore(nil)
+	if err != nil {
+		return nil, err
 	}
+	return &db{store: store}, nil
 }
 
 func (d *db) Put(key []byte, value []byte) error {
@@ -29,5 +32,9 @@ func (d *db) Get(key []byte) ([]byte, error) {
 }
 
 func (d *db) Delete(key []byte) error {
-	return d.store.Put(key, []byte{})
+	return d.store.Delete(key)
+}
+
+func (d *db) Close() {
+	d.store.Close()
 }

@@ -21,7 +21,7 @@ func (kv *KVStore) Compact() error {
 
 	// Build eligibleFiles from disk — this captures files with 0 live keydir
 	// entries (all entries overwritten) that would otherwise be missed.
-	allFileIDs, err := getSortedDataFileIds()
+	allFileIDs, err := getSortedDataFileIds(kv.dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to list data files: %w", err)
 	}
@@ -39,7 +39,7 @@ func (kv *KVStore) Compact() error {
 
 	kv.lock.Lock()
 	mergedFileId := kv.maxFileID + 1
-	mergedFile, err := createNewDataFile(mergedFileId)
+	mergedFile, err := createNewDataFile(kv.dataDir, mergedFileId)
 	if err != nil {
 		kv.lock.Unlock()
 		return fmt.Errorf("Failed to create merged file ID %d: %w", mergedFileId, err)
@@ -47,7 +47,7 @@ func (kv *KVStore) Compact() error {
 	kv.maxFileID = mergedFileId
 	kv.lock.Unlock()
 
-	hintFile, err := createNewHintFile(mergedFileId)
+	hintFile, err := createNewHintFile(kv.dataDir, mergedFileId)
 	if err != nil {
 		return fmt.Errorf("Failed to create hint file for merged file ID %d: %w", mergedFileId, err)
 	}
@@ -78,7 +78,7 @@ func (kv *KVStore) Compact() error {
 
 		file, ok := openedFiles[item.FileId]
 		if !ok {
-			file, err = openDataFile(item.FileId)
+			file, err = openDataFile(kv.dataDir, item.FileId)
 			if err != nil {
 				log.Printf("ERROR: Failed to open file ID %d for key '%s': %v", item.FileId, key, err)
 				fileFailedKeys[item.FileId] = true
@@ -118,12 +118,12 @@ func (kv *KVStore) Compact() error {
 
 			kv.lock.Lock()
 			mergedFileId = kv.maxFileID + 1
-			mergedFile, err = createNewDataFile(mergedFileId)
+			mergedFile, err = createNewDataFile(kv.dataDir, mergedFileId)
 			if err != nil {
 				kv.lock.Unlock()
 				return fmt.Errorf("Failed to create merged file ID %d: %w", mergedFileId, err)
 			}
-			hintFile, err = createNewHintFile(mergedFileId)
+			hintFile, err = createNewHintFile(kv.dataDir, mergedFileId)
 			if err != nil {
 				kv.lock.Unlock()
 				return fmt.Errorf("Failed to create hint file for merged file ID %d: %w", mergedFileId, err)
@@ -148,7 +148,7 @@ func (kv *KVStore) Compact() error {
 			Offset:    entryOffset,
 			Key:       entry.Key,
 		}
-		err = kv.writeHintFileEntry(hintFile, hintItem)
+		err = writeHintFileEntry(hintFile, hintItem)
 		if err != nil {
 			log.Printf("ERROR: Failed to write hint item for key '%s' to hint file for merged file ID %d: %v", key, mergedFile.ID, err)
 			fileFailedKeys[item.FileId] = true
@@ -206,7 +206,15 @@ func (kv *KVStore) Compact() error {
 			}
 			delete(openedFiles, fileId)
 		}
-		err := deleteDataFile(fileId)
+		// evict from file cache so future reads don't use a stale handle
+		kv.lock.Lock()
+		if cached, ok := kv.fileCache[fileId]; ok {
+			_ = cached.File.Close()
+			delete(kv.fileCache, fileId)
+		}
+		kv.lock.Unlock()
+
+		err := deleteDataFile(kv.dataDir, fileId)
 		if err != nil {
 			log.Printf("ERROR: Failed to delete old data file ID %d: %v", fileId, err)
 		}
